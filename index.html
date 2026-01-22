@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Squad Tools - Creator Analytics</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Left Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-logo">
+                <div class="logo-icon">
+                    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                        <rect width="32" height="32" rx="8" fill="#6366f1"/>
+                        <path d="M10 16L14 20L22 12" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <span class="logo-text">Squad Tools</span>
+            </div>
+
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-page="creator-report">
+                    <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                        <circle cx="12" cy="7" r="4"/>
+                    </svg>
+                    <span>Creator Report</span>
+                </a>
+                <a href="#" class="nav-item" data-page="brand-report">
+                    <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                        <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                    </svg>
+                    <span>Brand Report</span>
+                </a>
+                <a href="#" class="nav-item" data-page="post-analytics">
+                    <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="20" x2="18" y2="10"/>
+                        <line x1="12" y1="20" x2="12" y2="4"/>
+                        <line x1="6" y1="20" x2="6" y2="14"/>
+                    </svg>
+                    <span>Post Analytics</span>
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <span class="version">v1.0.0</span>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Top Bar -->
+            <header class="top-bar">
+                <div class="page-title">Creator Report</div>
+                <div class="user-profile">
+                    <span class="user-name">Alex Morgan</span>
+                    <div class="user-avatar">
+                        <img src="https://i.pravatar.cc/40?img=33" alt="Alex Morgan" />
+                    </div>
+                </div>
+            </header>
+
+            <!-- Content Area -->
+            <div class="content-area">
+                <!-- Creator Report Page -->
+                <div id="page-creator-report" class="page active">
+                    <!-- Search View -->
+                    <div id="search-view" class="search-view">
+                        <div class="search-container">
+                            <h1 class="search-title">Find a Creator</h1>
+                            <p class="search-subtitle">Search for any influencer to get detailed analytics</p>
+
+                            <div class="search-box">
+                                <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                <input type="text" id="creator-search" placeholder="Search by name or @handle..." autocomplete="off">
+                                <div id="search-suggestions" class="search-suggestions hidden"></div>
+                            </div>
+                        </div>
+
+                        <!-- Previously Requested Reports -->
+                        <div id="previous-reports" class="previous-reports">
+                            <h3 class="section-title">Previously Requested Reports</h3>
+                            <div class="previous-list" id="previous-list"></div>
+                        </div>
+                    </div>
+
+                    <!-- Loading Modal -->
+                    <div id="loading-modal" class="loading-modal hidden">
+                        <div class="loading-content">
+                            <div class="loading-spinner"></div>
+                            <h2 class="loading-title">Generating Report</h2>
+                            <p class="loading-creator" id="loading-creator-name"></p>
+                            <div class="progress-container">
+                                <div class="progress-bar" id="progress-bar"></div>
+                            </div>
+                            <p class="loading-stage" id="loading-stage">Initializing...</p>
+                        </div>
+                    </div>
+
+                    <!-- Full Report View -->
+                    <div id="report-view" class="report-view hidden">
+                        <button class="back-button" id="back-to-search">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="19" y1="12" x2="5" y2="12"/>
+                                <polyline points="12 19 5 12 12 5"/>
+                            </svg>
+                            Back to Search
+                        </button>
+
+                        <div class="report-header" id="report-header"></div>
+                        <div class="report-grid" id="report-content"></div>
+                    </div>
+                </div>
+
+                <!-- Brand Report Page (Placeholder) -->
+                <div id="page-brand-report" class="page">
+                    <div class="placeholder-page">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
+                            <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                            <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                        </svg>
+                        <h2>Brand Report</h2>
+                        <p>Brand analytics coming soon</p>
+                    </div>
+                </div>
+
+                <!-- Post Analytics Page (Placeholder) -->
+                <div id="page-post-analytics" class="page">
+                    <div class="placeholder-page">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
+                            <line x1="18" y1="20" x2="18" y2="10"/>
+                            <line x1="12" y1="20" x2="12" y2="4"/>
+                            <line x1="6" y1="20" x2="6" y2="14"/>
+                        </svg>
+                        <h2>Post Analytics</h2>
+                        <p>Post-level insights coming soon</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
