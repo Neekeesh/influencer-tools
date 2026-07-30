@@ -21,8 +21,17 @@ Locating strategy
 Rows are anchored on the dark left-hand LABEL (multi-line labels are
 joined), with the small grey hint beneath it as a secondary
 disambiguator.  The input box is then the grey rounded rect on the same
-row: to the right of the label, vertically overlapping it.  Anything
-that does not resolve to exactly one target is reported, never guessed.
+row: to the right of the label, vertically overlapping it.
+
+Nothing is keyed to a page number or an absolute position.  Every
+anchor is searched across the whole document and must resolve to
+exactly one target; zero matches, or matches on more than one page, are
+reported rather than guessed.  Line-join tolerances are expressed in
+multiples of the line height, so a re-export at a different type scale
+still works.
+
+One drawn box produces exactly one field.  Field count follows box
+count, never the wording of the hint.
 
 Single-line vs multiline is *derived from the document*: the located box
 heights are clustered and the threshold is the midpoint of the widest
@@ -52,7 +61,8 @@ Requires: pikepdf, pymupdf, pypdf
 Usage:
     python3 add_form_fields.py                 # build every document
     python3 add_form_fields.py --only doc_a
-    python3 add_form_fields.py --shift-test    # re-export robustness check
+    python3 add_form_fields.py --shift-test       # layout-shift robustness
+    python3 add_form_fields.py --repaginate-test  # page-independence proof
     python3 add_form_fields.py --verify-only out.pdf
 """
 
@@ -106,12 +116,17 @@ GREY_BOX_FILL = (0xF2, 0xF1, 0xF6)       # the rounded input boxes
 FOOTER_TEXT_PATTERNS = (r"^www\.", r"^\d{1,3}$")
 
 # Label blocks: consecutive lines are joined when they share a left edge,
-# share a colour and size, and follow each other closely.
-LABEL_JOIN_MAX_GAP = 3.0
+# share a colour and size, and follow each other closely.  Vertical
+# tolerances are multiples of the line height, not points, so the same
+# numbers hold when a re-export changes the type scale.  Wrapped lines in
+# these exports can overlap slightly, hence the negative tolerance.
+LABEL_JOIN_MAX_GAP_EM = 0.35
+LABEL_JOIN_MAX_OVERLAP_EM = 0.25
 LABEL_JOIN_X_TOL = 1.0
 
 # Hint blocks: grey lines starting below the label block, same left edge.
-HINT_MAX_GAP = 6.0
+HINT_MAX_GAP_EM = 0.7
+HINT_MAX_OVERLAP_EM = 0.3
 HINT_X_TOL = 1.5
 # "USDC-" + "equivalent" -> "USDC-equivalent" rather than "USDC- equivalent".
 JOIN_HYPHENATED_HINTS = True
@@ -150,60 +165,55 @@ HEIGHT_CLUSTER_MIN_GAP = 4.0       # pt; smaller gaps are within-cluster noise
 HEIGHT_CLUSTER_GAP_RATIO = 2.5     # widest gap must beat the runner-up by this
 HEIGHT_AMBIGUITY_BAND = 1.5        # pt either side of the threshold
 
-# --------------------------------------------------------- contact splitting
-# A hint of "Full name, email, phone" means one box holding three answers.
-# Split it into three single-line fields: stacked if the box is tall enough
-# to give each row a usable height, otherwise side by side.
-CONTACT_PARTS = ("name", "email", "phone")
-CONTACT_PART_LABELS = ("Full name", "Email", "Phone")
-CONTACT_MIN_STACK_ROW_HEIGHT = 13.0        # per row, to allow stacking
-CONTACT_COLUMN_WEIGHTS = (0.32, 0.40, 0.28)  # name / email / phone
-CONTACT_COLUMN_GUTTER = 6.0
-
 # ---------------------------------------------------------------- field map
-# Constructors used by the per-document field lists below.
+# Constructors used by the per-document field lists below.  None of them
+# takes a page: every anchor is searched document-wide.
 #
-#   Row(name, page, label=..., hint=..., kind=...)
-#       kind: "auto"     -> single or multi, decided by the height clusters
-#             "single"   -> force single-line
-#             "multi"    -> force multiline
-#             "contact3" -> split into _name / _email / _phone
+#   Row(name, label=..., hint=..., kind=...)
+#       One drawn box -> one field.
+#       kind: "auto"   -> single or multi, decided by the height clusters
+#             "single" -> force single-line
+#             "multi"  -> force multiline
 #       hint is a secondary disambiguator, used when a label matches more
 #       than one block; a mismatch elsewhere is reported as a warning.
 #
-#   Check(name, page, caption=..., check=...)
-#   Signature(prefix, page, block=..., rows=...)
+#   Check(name, caption=..., check=...)
+#   Signature(prefix, block=..., rows=...)
 #       expands to <prefix>_signature (/FT /Sig) plus one text field per row.
+#
+# List order is tab order.  Page assignment comes from where each field is
+# actually found, and the verification pass checks that each page's
+# resulting sequence really does read top to bottom.
 
 
 @dataclass
 class Spec:
     name: str
-    page: int                       # 1-based
     kind: str                       # row | checkbox | signature | signature_row
     locator: dict[str, Any]
-    sizing: str = "auto"            # auto | single | multi | contact3
+    sizing: str = "auto"            # auto | single | multi
     tooltip: Optional[str] = None
     check_color: tuple[float, float, float] = CHECK_DARK
+    group: Optional[str] = None     # signature blocks tab together as a column
 
 
-def Row(name, page, *, label, hint=None, kind="auto", tooltip=None):
-    return Spec(name, page, "row", {"label": label, "hint": hint},
+def Row(name, *, label, hint=None, kind="auto", tooltip=None):
+    return Spec(name, "row", {"label": label, "hint": hint},
                 sizing=kind, tooltip=tooltip)
 
 
-def Check(name, page, *, caption, check=CHECK_DARK, tooltip=None):
-    return Spec(name, page, "checkbox", {"caption": caption},
+def Check(name, *, caption, check=CHECK_DARK, tooltip=None):
+    return Spec(name, "checkbox", {"caption": caption},
                 tooltip=tooltip, check_color=check)
 
 
-def Signature(prefix, page, *, block, rows=("Name", "Title", "Date")):
-    out = [Spec(f"{prefix}_signature", page, "signature", {"block": block},
-                tooltip=f"{block}: signature")]
+def Signature(prefix, *, block, rows=("Name", "Title", "Date")):
+    out = [Spec(f"{prefix}_signature", "signature", {"block": block},
+                tooltip=f"{block}: signature", group=block)]
     for row in rows:
-        out.append(Spec(f"{prefix}_{row.lower()}", page, "signature_row",
-                        {"block": block, "row": row},
-                        sizing="single", tooltip=f"{block}: {row.lower()}"))
+        out.append(Spec(f"{prefix}_{row.lower()}", "signature_row",
+                        {"block": block, "row": row}, sizing="single",
+                        tooltip=f"{block}: {row.lower()}", group=block))
     return out
 
 
@@ -227,88 +237,88 @@ DOC_A = DocumentConfig(
     signature_caption="Signature",
     fields=[
         # ---- page 3: Optional services - 3. Marketing ----
-        Check("marketing_publications", 3, caption="Publications"),
-        Check("marketing_partnerships_co_marketing", 3,
+        Check("marketing_publications", caption="Publications"),
+        Check("marketing_partnerships_co_marketing",
               caption="Partnerships & Co-Marketing"),
-        Check("marketing_dashboard_placements", 3,
+        Check("marketing_dashboard_placements",
               caption="Dashboard Placements"),
-        Check("marketing_influencer_marketing", 3,
+        Check("marketing_influencer_marketing",
               caption="Influencer Marketing"),
 
         # ---- page 3: Token issuer information - 1. Issuer / Applicant ----
-        Row("issuer_legal_name", 3,
+        Row("issuer_legal_name",
             label="Legal name of the issuing entity",
             hint="Full registered name"),
-        Row("issuer_jurisdiction_of_incorporation", 3,
+        Row("issuer_jurisdiction_of_incorporation",
             label="In which jurisdiction is the company incorporated",
             hint="Country of incorporation"),
-        Row("issuer_company_address", 3,
+        Row("issuer_company_address",
             label="Company address",
             hint="Street, postcode, city, country"),
-        Row("issuer_company_register_no", 3,
+        Row("issuer_company_register_no",
             label="Company register No.",
             hint="if available or similar unique national identifier"),
-        Row("issuer_lei", 3, label="LEI",
+        Row("issuer_lei", label="LEI",
             hint="20-character code; if available"),
-        Row("issuer_fatca_id", 3, label="FATCA-ID",
+        Row("issuer_fatca_id", label="FATCA-ID",
             hint="6-character code; if available"),
-        Row("issuer_giin", 3, label="GIIN",
+        Row("issuer_giin", label="GIIN",
             hint="19-character code; if available"),
-        Row("issuer_primary_business_contact", 3,
+        Row("issuer_primary_business_contact",
             label="Primary business contact",
-            hint="Full name, email, phone", kind="contact3"),
-        Row("issuer_legal_compliance_contact", 3,
+            hint="Full name, email, phone"),
+        Row("issuer_legal_compliance_contact",
             label="Legal / Compliance contact",
-            hint="Full name, email, phone", kind="contact3"),
+            hint="Full name, email, phone"),
 
         # ---- page 4: 2. Due diligence ----
-        Row("dd_ubo_signatory_1", 4,
+        Row("dd_ubo_signatory_1",
             label="UBO with signatory power 1",
-            hint="Full name, email, phone", kind="contact3"),
-        Row("dd_representative_1", 4,
+            hint="Full name, email, phone"),
+        Row("dd_representative_1",
             label="Representative 1",
-            hint="Full name, email, phone", kind="contact3"),
+            hint="Full name, email, phone"),
 
         # ---- page 4: 3. Securities offering data ----
-        Row("offering_token_name", 4, label="Token name",
+        Row("offering_token_name", label="Token name",
             hint="Name of the token as it will be listed"),
-        Row("offering_isin", 4, label="ISIN", hint="if available"),
-        Row("offering_symbol", 4, label="Symbol", hint="Ticker symbol"),
-        Row("offering_token_pairs", 4,
+        Row("offering_isin", label="ISIN", hint="if available"),
+        Row("offering_symbol", label="Symbol", hint="Ticker symbol"),
+        Row("offering_token_pairs",
             label="Which token pairs should be listed",
             hint="e.g. Token/USDC, or EURO stablecoin, etc."),
-        Row("offering_total_token_supply", 4, label="Total token supply",
+        Row("offering_total_token_supply", label="Total token supply",
             hint="e.g. 100,000,000 max · placed at listing 20,000,000"),
-        Row("offering_target_go_live_date", 4, label="Target go-live date",
+        Row("offering_target_go_live_date", label="Target go-live date",
             hint="Preferred date and any hard external deadlines"),
-        Row("offering_other_trading_venues", 4, label="Other trading venues",
+        Row("offering_other_trading_venues", label="Other trading venues",
             hint="if available"),
 
         # ---- page 4: 4. Technical data ----
-        Row("technical_blockchain_network", 4, label="Blockchain network",
+        Row("technical_blockchain_network", label="Blockchain network",
             hint="e.g. Ethereum mainnet / Polygon / Base — chain ID if non-mainnet"),
-        Row("technical_token_standard", 4, label="Token standard",
+        Row("technical_token_standard", label="Token standard",
             hint="ERC-20 / ERC-3475 / ERC-3643 — describe wrapper if non-standard"),
-        Row("technical_smart_contract_address", 4,
+        Row("technical_smart_contract_address",
             label="Smart contract address", hint="0x…"),
-        Row("technical_token_price_at_issuance", 4,
+        Row("technical_token_price_at_issuance",
             label="Token price at issuance", hint="e.g. 1.00 USDC per token"),
-        Row("technical_decimal_precision", 4, label="Decimal precision",
+        Row("technical_decimal_precision", label="Decimal precision",
             hint="18 decimals (standard ERC-20) / 6 decimals (USDC-equivalent)"),
-        Row("technical_minimum_subscription_amount", 4,
+        Row("technical_minimum_subscription_amount",
             label="Minimum subscription amount",
             hint="specify if different for retail vs. professional investors"),
-        Row("technical_interest_and_redemption_flow", 4,
+        Row("technical_interest_and_redemption_flow",
             label="Interest payments & redemption flow",
             hint="e.g. Issuer wallet → treasury → investors; redemption within 5 days"),
 
         # ---- page 5: acceptance + signatures ----
         # White tick: this checkbox is an outline on a saturated purple band.
-        Check("accept_terms", 5,
+        Check("accept_terms",
               caption="I accept the terms as outlined in this offer.",
               check=CHECK_LIGHT),
-        *Signature("signature_issuer", 5, block="Issuer — Authorized Signatory"),
-        *Signature("signature_assetera", 5,
+        *Signature("signature_issuer", block="Issuer — Authorized Signatory"),
+        *Signature("signature_assetera",
                    block="Assetera GmbH — Countersignature"),
     ],
 )
@@ -325,162 +335,162 @@ DOC_B = DocumentConfig(
     signature_caption="Digital signature",
     fields=[
         # ---- page 2: 1. Tokenization and listing ----
-        Check("service_smart_contract_audit", 2, caption="Smart Contract Audit"),
-        Check("service_management_registry_admin_tool", 2,
+        Check("service_smart_contract_audit", caption="Smart Contract Audit"),
+        Check("service_management_registry_admin_tool",
               caption="Management, Registry, Maintenance and Admin Tool (monthly)"),
 
         # ---- page 3: Optional services - 3. Marketing ----
-        Check("marketing_publications", 3, caption="Publications"),
-        Check("marketing_partnerships_co_marketing", 3,
+        Check("marketing_publications", caption="Publications"),
+        Check("marketing_partnerships_co_marketing",
               caption="Partnerships & Co-Marketing"),
-        Check("marketing_dashboard_placements", 3,
+        Check("marketing_dashboard_placements",
               caption="Dashboard Placements"),
-        Check("marketing_influencer_marketing", 3,
+        Check("marketing_influencer_marketing",
               caption="Influencer Marketing"),
 
         # ---- page 4: Optional services - 4. Legal and regulatory ----
-        Check("legal_structuring", 4, caption="Legal Structuring"),
-        Check("legal_regulatory_documentation", 4,
+        Check("legal_structuring", caption="Legal Structuring"),
+        Check("legal_regulatory_documentation",
               caption="Regulatory Documentation"),
 
         # ---- page 4: Token issuer information - 1. Issuer / Applicant ----
-        Row("issuer_legal_name", 4,
+        Row("issuer_legal_name",
             label="Legal name of the issuing entity",
             hint="Full registered name"),
-        Row("issuer_jurisdiction_of_incorporation", 4,
+        Row("issuer_jurisdiction_of_incorporation",
             label="In which jurisdiction is the company incorporated",
             hint="Country of incorporation"),
-        Row("issuer_company_address", 4, label="Company address",
+        Row("issuer_company_address", label="Company address",
             hint="Street, postcode, city, country"),
-        Row("issuer_company_register_no", 4, label="Company register No.",
+        Row("issuer_company_register_no", label="Company register No.",
             hint="If available, or similar unique national identifier"),
-        Row("issuer_financial_licenses", 4,
+        Row("issuer_financial_licenses",
             label="Does the company hold any financial licenses or regulatory authorizations",
             hint="e.g. MiFID II, AIFMD, UCITS, SEC-registered"),
-        Row("issuer_planned_legal_structure", 4,
+        Row("issuer_planned_legal_structure",
             label="What is the planned legal structure for the issuance",
             hint="NewCo / SPV / Fund Compartment (e.g. Luxembourg) / Existing entity — describe"),
-        Row("issuer_lei", 4, label="LEI",
+        Row("issuer_lei", label="LEI",
             hint="20-character code; if available"),
-        Row("issuer_fatca_id", 4, label="FATCA-ID",
+        Row("issuer_fatca_id", label="FATCA-ID",
             hint="6-character code; if available"),
-        Row("issuer_giin", 4, label="GIIN",
+        Row("issuer_giin", label="GIIN",
             hint="19-character code; if available"),
-        Row("issuer_primary_business_contact", 4,
+        Row("issuer_primary_business_contact",
             label="Primary business contact",
-            hint="Full name, email, phone", kind="contact3"),
-        Row("issuer_legal_compliance_contact", 4,
+            hint="Full name, email, phone"),
+        Row("issuer_legal_compliance_contact",
             label="Legal / Compliance contact",
-            hint="Full name, email, phone", kind="contact3"),
+            hint="Full name, email, phone"),
 
         # ---- page 5: 2. Due diligence ----
-        Row("dd_ubo_signatory_1", 5, label="UBO with signatory power 1",
-            hint="Full name, email, phone", kind="contact3"),
-        Row("dd_representative_1", 5, label="Representative 1",
-            hint="Full name, email, phone", kind="contact3"),
+        Row("dd_ubo_signatory_1", label="UBO with signatory power 1",
+            hint="Full name, email, phone"),
+        Row("dd_representative_1", label="Representative 1",
+            hint="Full name, email, phone"),
 
         # ---- page 5: 3. Asset to be tokenized ----
-        Row("asset_type", 5,
+        Row("asset_type",
             label="What type of asset or product is to be tokenized",
             hint="Asset class and investment structure — e.g. real estate, private credit, bond, equity, fund interest, commodity, infrastructure, receivable"),
-        Row("asset_description", 5,
+        Row("asset_description",
             label="Please describe the underlying asset in detail",
             hint="Structure, revenue model, and key risks"),
-        Row("asset_new_or_existing", 5,
+        Row("asset_new_or_existing",
             label="Is this a new product, or an existing product / fund being tokenized",
             hint="Newly established product, or an existing fund / asset / instrument"),
-        Row("asset_target_issuance_volume_eur", 5,
+        Row("asset_target_issuance_volume_eur",
             label="What is the target total issuance volume in EUR",
             hint="Expected aggregate issuance amount (hard cap) in EUR"),
-        Row("asset_open_or_closed_ended", 5,
+        Row("asset_open_or_closed_ended",
             label="Is the product open-ended or closed-ended",
             hint="Open-ended (continuous subscriptions and redemptions) or closed-ended (defined fundraising period)"),
-        Row("asset_listing_start_date", 5,
+        Row("asset_listing_start_date",
             label="What is the intended listing / offering start date",
             hint="Expected launch date, including any pre-marketing, private placement or public offering phases"),
-        Row("asset_maturity_or_redemption_date", 5,
+        Row("asset_maturity_or_redemption_date",
             label="Is there a maturity date or planned redemption date",
             hint="Contractual maturity, expected term or redemption timeline; if none, describe the intended exit and liquidity"),
 
         # ---- page 5: 4. Product governance data ----
-        Row("governance_client_knowledge_level", 5,
+        Row("governance_client_knowledge_level",
             label="At what client knowledge & experience level is the product targeted",
             hint="Basic (general investor) / Informed (some financial knowledge) / Advanced (professional, institutional)"),
-        Row("governance_investor_risk_tolerance", 5,
+        Row("governance_investor_risk_tolerance",
             label="What is the investor risk tolerance for this product",
             hint="Conservative / Balanced / Risk-oriented or speculative"),
-        Row("governance_negative_target_market", 5,
+        Row("governance_negative_target_market",
             label="Negative target market (who should NOT invest)",
             hint="e.g. Retail clients / Investors requiring capital protection / Execution-only clients"),
-        Row("governance_eligible_investor_types", 5,
+        Row("governance_eligible_investor_types",
             label="Which investor types are eligible to invest",
             hint="Retail / Professional / Institutional / Qualified Purchaser / Accredited Investor only"),
 
         # ---- page 6: 5. Securities offering data ----
-        Row("offering_token_name", 6, label="Token name",
+        Row("offering_token_name", label="Token name",
             hint="Name of the token as it will be listed"),
-        Row("offering_isin", 6, label="ISIN",
+        Row("offering_isin", label="ISIN",
             hint="To be requested: Yes / No"),
-        Row("offering_symbol", 6, label="Symbol", hint="Ticker symbol"),
-        Row("offering_token_pair", 6,
+        Row("offering_symbol", label="Symbol", hint="Ticker symbol"),
+        Row("offering_token_pair",
             label="Which token pair should be listed",
             hint="e.g. Token/USDC (USD stablecoin) or Token/EURO stablecoin"),
-        Row("offering_total_token_supply", 6, label="Total token supply",
+        Row("offering_total_token_supply", label="Total token supply",
             hint="e.g. 100,000,000 tokens (max)"),
-        Row("offering_total_volume_on_assetera", 6,
+        Row("offering_total_volume_on_assetera",
             label="Total token volume on Assetera",
             hint="e.g. Assetera volume at listing: 20,000,000"),
-        Row("offering_fee_structure", 6,
+        Row("offering_fee_structure",
             label="What is the fee structure for this product",
             hint="Management fee (% p.a.) / Performance fee / Carried interest / Servicing fee / Subscription fee — list all"),
-        Row("offering_target_go_live_date", 6, label="Target go-live date",
+        Row("offering_target_go_live_date", label="Target go-live date",
             hint="Preferred date and any hard external deadlines"),
-        Row("offering_redemption_terms", 6,
+        Row("offering_redemption_terms",
             label="Are there redemption or repayment terms planned",
             hint="At maturity / Early redemption window / On investor request — describe conditions"),
-        Row("offering_payment_currency", 6,
+        Row("offering_payment_currency",
             label="In which currency will investors make payment and receive payouts",
             hint="EUR stablecoin / USD stablecoin / Fiat"),
-        Row("offering_generates_yield", 6,
+        Row("offering_generates_yield",
             label="Does the product generate interest, dividends, or coupon payments",
             hint="Yes — describe yield source / No"),
-        Row("offering_yield_terms", 6,
+        Row("offering_yield_terms",
             label="If yield-bearing — rate, payment frequency, and lock-in period",
             hint="e.g. 6% p.a. fixed, paid quarterly, 1-year lock-in then quarterly redemptions"),
-        Row("offering_interest_and_redemption_flow", 6,
+        Row("offering_interest_and_redemption_flow",
             label="Intended interest payments & redemption flow",
             hint="e.g. Issuer → Assetera → investor accounts; redemptions within 5 business days"),
 
         # ---- page 7: 6. Technical data ----
-        Row("technical_blockchain_network", 7, label="Blockchain network",
+        Row("technical_blockchain_network", label="Blockchain network",
             hint="e.g. Ethereum mainnet / Polygon mainnet / Base"),
-        Row("technical_token_standard", 7, label="Token standard",
+        Row("technical_token_standard", label="Token standard",
             hint="ERC-20 / ERC-3475 / ERC-3643 — if available"),
-        Row("technical_smart_contract_address", 7,
+        Row("technical_smart_contract_address",
             label="Smart contract address", hint="0x… — to be filled"),
-        Row("technical_token_price_at_issuance", 7,
+        Row("technical_token_price_at_issuance",
             label="Token price at issuance", hint="e.g. 1.00 USDC per token"),
-        Row("technical_decimal_precision", 7, label="Decimal precision",
+        Row("technical_decimal_precision", label="Decimal precision",
             hint="18 decimals (standard ERC-20) / 6 decimals (USDC-equivalent)"),
-        Row("technical_minimum_subscription_amount", 7,
+        Row("technical_minimum_subscription_amount",
             label="Minimum subscription amount", hint="e.g. 1,000 USDC"),
-        Row("technical_assetera_maintains_register", 7,
+        Row("technical_assetera_maintains_register",
             label="Should Assetera maintain the investor register on behalf of the issuer",
             hint="Yes / No — if no, describe who maintains it"),
-        Row("technical_list_on_secondary_marketplace", 7,
+        Row("technical_list_on_secondary_marketplace",
             label="Should tokens be listed on Assetera's secondary trading marketplace",
             hint="Yes, after distribution / No secondary trading"),
-        Row("technical_other_trading_venues", 7,
+        Row("technical_other_trading_venues",
             label="Other trading venues", hint="If available"),
 
         # ---- page 8: acceptance + signatures ----
         # Dark tick: unlike document A this checkbox is white-filled on a pale
         # lavender band, so the standard dark tick reads correctly.
-        Check("accept_terms", 8,
+        Check("accept_terms",
               caption="I accept the terms as outlined in this offer.",
               check=CHECK_DARK),
-        *Signature("signature_issuer", 8, block="Issuer — Authorized Signatory"),
-        *Signature("signature_assetera", 8,
+        *Signature("signature_issuer", block="Issuer — Authorized Signatory"),
+        *Signature("signature_assetera",
                    block="Assetera GmbH — Countersignature"),
     ],
 )
@@ -628,10 +638,16 @@ def _label_blocks(geo: PageGeometry, first: TextLine) -> Block:
     parts = [first]
     for line in geo.lines:
         prev = parts[-1]
-        if line is prev or line.rect.y0 < prev.rect.y1 - 0.1:
+        if line is prev:
+            continue
+        h = max(line.rect.height, 1.0)
+        # must be a genuinely following line, not another column on this row
+        if line.rect.y0 <= prev.rect.y0 + 0.5 * h:
+            continue
+        gap = line.rect.y0 - prev.rect.y1
+        if not (-LABEL_JOIN_MAX_OVERLAP_EM * h <= gap <= LABEL_JOIN_MAX_GAP_EM * h):
             continue
         if (abs(line.rect.x0 - prev.rect.x0) <= LABEL_JOIN_X_TOL
-                and 0 <= line.rect.y0 - prev.rect.y1 <= LABEL_JOIN_MAX_GAP
                 and line.color == prev.color
                 and abs(line.size - prev.size) < 0.05):
             parts.append(line)
@@ -668,7 +684,8 @@ def find_hint_block(geo: PageGeometry, label: Block) -> Optional[Block]:
             continue
         if abs(line.rect.x0 - label.rect.x0) > HINT_X_TOL:
             continue
-        if 0 <= line.rect.y0 - cursor <= HINT_MAX_GAP:
+        h = max(line.rect.height, 1.0)
+        if -HINT_MAX_OVERLAP_EM * h <= line.rect.y0 - cursor <= HINT_MAX_GAP_EM * h:
             parts.append(line)
             cursor = line.rect.y1
     if not parts:
@@ -696,160 +713,150 @@ def _grey_boxes(geo: PageGeometry, height_range, min_width) -> list[VectorRect]:
             and v.rect.width >= min_width and lo <= v.rect.height <= hi]
 
 
-def locate_row(geo: PageGeometry, spec: Spec) -> Located:
+def locate_row(geo: PageGeometry, spec: Spec) -> tuple[list[Located], list[str]]:
     """Label -> (hint) -> the grey box on the same row, to its right."""
     label_text = spec.locator["label"]
-    want_hint = spec.locator.get("hint")
-
-    blocks = find_label_block(geo, label_text)
-    if not blocks:
-        raise Unlocatable(
-            f"{spec.name}: no label reading {label_text!r} on page "
-            f"{geo.index + 1}")
-
-    warning = None
-    hints = {id(b): find_hint_block(geo, b) for b in blocks}
-
-    if len(blocks) > 1 and want_hint:
-        narrowed = [b for b in blocks
-                    if hints[id(b)] and norm(hints[id(b)].text) == norm(want_hint)]
-        if len(narrowed) == 1:
-            blocks = narrowed
-    if len(blocks) != 1:
-        raise Unlocatable(
-            f"{spec.name}: label {label_text!r} matched {len(blocks)} blocks "
-            f"on page {geo.index + 1}; hint did not disambiguate")
-
-    label = blocks[0]
-    hint = hints[id(label)]
-    if want_hint and (hint is None or norm(hint.text) != norm(want_hint)):
-        warning = (f"{spec.name}: hint is {hint.text if hint else None!r}, "
-                   f"config says {want_hint!r}")
+    out: list[Located] = []
+    notes: list[str] = []
 
     boxes = _grey_boxes(geo, INPUT_BOX_HEIGHT_RANGE, INPUT_BOX_MIN_WIDTH)
-    lh = label.rect.height
-    hits = [v.rect for v in boxes
-            if v.rect.x0 > label.rect.x1
-            and v.rect.x0 - label.rect.x1 <= ROW_BOX_MAX_GAP
-            and (min(v.rect.y1, label.rect.y1) - max(v.rect.y0, label.rect.y0)
-                 >= ROW_BOX_MIN_OVERLAP * lh)]
-    if len(hits) != 1:
-        raise Unlocatable(
-            f"{spec.name}: {len(hits)} input boxes on the row of "
-            f"{label_text!r} (page {geo.index + 1}); need exactly 1")
+    for label in find_label_block(geo, label_text):
+        hint = find_hint_block(geo, label)
+        lh = label.rect.height
+        hits = [v.rect for v in boxes
+                if v.rect.x0 > label.rect.x1
+                and v.rect.x0 - label.rect.x1 <= ROW_BOX_MAX_GAP
+                and (min(v.rect.y1, label.rect.y1)
+                     - max(v.rect.y0, label.rect.y0)) >= ROW_BOX_MIN_OVERLAP * lh]
+        if len(hits) != 1:
+            notes.append(f"page {geo.index + 1}: {len(hits)} input boxes on the "
+                         f"row of {label_text!r}")
+            continue
+        b = hits[0]
+        out.append(Located(
+            fitz.Rect(b.x0 + BOX_PAD_LEFT, b.y0 + BOX_PAD_Y,
+                      b.x1 - BOX_PAD_RIGHT, b.y1 - BOX_PAD_Y),
+            hint=(hint.text if hint else None),
+            box_height=round(b.height, 1)))
+    return out, notes
 
-    b = hits[0]
-    rect = fitz.Rect(b.x0 + BOX_PAD_LEFT, b.y0 + BOX_PAD_Y,
-                     b.x1 - BOX_PAD_RIGHT, b.y1 - BOX_PAD_Y)
-    return Located(rect, hint=(hint.text if hint else None),
-                   box_height=round(b.height, 1), warning=warning)
 
-
-def locate_checkbox(geo: PageGeometry, spec: Spec) -> Located:
-    caption = geo.one_line(spec.locator["caption"], spec.name)
+def locate_checkbox(geo: PageGeometry, spec: Spec) -> tuple[list[Located],
+                                                            list[str]]:
     lo, hi = CHECKBOX_SIZE_RANGE
+    out: list[Located] = []
+    notes: list[str] = []
 
-    cands = []
-    for v in geo.rects:
-        r = v.rect
-        if not (lo <= r.width <= hi and lo <= r.height <= hi):
-            continue
-        if abs(r.width - r.height) > CHECKBOX_MAX_ASPECT_SKEW:
-            continue
-        if r.x1 > caption.rect.x0 + 1:
-            continue
-        if caption.rect.x0 - r.x1 > CHECKBOX_MAX_GAP:
-            continue
-        overlap = min(r.y1, caption.rect.y1) - max(r.y0, caption.rect.y0)
-        if overlap < CHECKBOX_MIN_VERTICAL_OVERLAP * min(r.height,
-                                                         caption.rect.height):
-            continue
-        cands.append(r)
+    for caption in geo.lines_matching(spec.locator["caption"]):
+        cands = []
+        for v in geo.rects:
+            r = v.rect
+            if not (lo <= r.width <= hi and lo <= r.height <= hi):
+                continue
+            if abs(r.width - r.height) > CHECKBOX_MAX_ASPECT_SKEW:
+                continue
+            if r.x1 > caption.rect.x0 + 1:
+                continue
+            if caption.rect.x0 - r.x1 > CHECKBOX_MAX_GAP:
+                continue
+            overlap = min(r.y1, caption.rect.y1) - max(r.y0, caption.rect.y0)
+            if overlap < CHECKBOX_MIN_VERTICAL_OVERLAP * min(
+                    r.height, caption.rect.height):
+                continue
+            cands.append(r)
 
-    if not cands:
-        raise Unlocatable(
-            f"{spec.name}: no square box left of {spec.locator['caption']!r} "
-            f"on page {geo.index + 1}")
-
-    merged: list[fitz.Rect] = []       # rounded outlines are two nested paths
-    for r in sorted(cands, key=lambda r: (r.x0, r.y0)):
-        for m in merged:
-            if m.intersects(r):
-                m |= r
-                break
-        else:
-            merged.append(fitz.Rect(r))
-    if len(merged) != 1:
-        raise Unlocatable(
-            f"{spec.name}: {len(merged)} distinct squares left of "
-            f"{spec.locator['caption']!r} on page {geo.index + 1}")
-    return Located(merged[0])
+        merged: list[fitz.Rect] = []   # a rounded outline is two nested paths
+        for r in sorted(cands, key=lambda r: (r.x0, r.y0)):
+            for m in merged:
+                if m.intersects(r):
+                    m |= r
+                    break
+            else:
+                merged.append(fitz.Rect(r))
+        if len(merged) != 1:
+            notes.append(f"page {geo.index + 1}: {len(merged)} squares left of "
+                         f"{spec.locator['caption']!r}")
+            continue
+        out.append(Located(merged[0]))
+    return out, notes
 
 
 def locate_signature_panel(geo: PageGeometry, spec: Spec,
-                           doc: DocumentConfig) -> Located:
-    heading = geo.one_line(spec.locator["block"], spec.name)
+                           doc: DocumentConfig) -> tuple[list[Located],
+                                                         list[str]]:
+    out: list[Located] = []
+    notes: list[str] = []
     panels = _grey_boxes(geo, SIGNATURE_PANEL_HEIGHT_RANGE,
                          SIGNATURE_PANEL_MIN_WIDTH)
     captions = geo.lines_matching(doc.signature_caption)
 
-    hits = [v.rect for v in panels
-            if v.rect.x0 - SIGNATURE_BLOCK_X_TOL <= heading.rect.x0 <= v.rect.x1
-            and v.rect.y0 >= heading.rect.y1 - 1
-            and any(v.rect.contains(c.rect) for c in captions)]
-    if len(hits) != 1:
-        raise Unlocatable(
-            f"{spec.name}: {len(hits)} panels captioned "
-            f"{doc.signature_caption!r} under {spec.locator['block']!r} on "
-            f"page {geo.index + 1}")
-    p = hits[0]
-    return Located(fitz.Rect(p.x0 + BOX_PAD_Y, p.y0 + BOX_PAD_Y,
-                             p.x1 - BOX_PAD_Y, p.y1 - BOX_PAD_Y))
+    for heading in geo.lines_matching(spec.locator["block"]):
+        hits = [v.rect for v in panels
+                if v.rect.x0 - SIGNATURE_BLOCK_X_TOL <= heading.rect.x0 <= v.rect.x1
+                and v.rect.y0 >= heading.rect.y1 - 1
+                and any(v.rect.contains(c.rect) for c in captions)]
+        if len(hits) != 1:
+            notes.append(f"page {geo.index + 1}: {len(hits)} panels captioned "
+                         f"{doc.signature_caption!r} under "
+                         f"{spec.locator['block']!r}")
+            continue
+        p = hits[0]
+        out.append(Located(fitz.Rect(p.x0 + BOX_PAD_Y, p.y0 + BOX_PAD_Y,
+                                     p.x1 - BOX_PAD_Y, p.y1 - BOX_PAD_Y)))
+    return out, notes
 
 
-def locate_signature_row(geo: PageGeometry, spec: Spec) -> Located:
+def locate_signature_row(geo: PageGeometry, spec: Spec) -> tuple[list[Located],
+                                                                 list[str]]:
     """Name / Title / Date -- the target is a grey box or a ruled line."""
-    heading = geo.one_line(spec.locator["block"], spec.name)
     row = spec.locator["row"]
+    out: list[Located] = []
+    notes: list[str] = []
 
-    labels = [l for l in geo.lines_matching(row)
-              if abs(l.rect.x0 - heading.rect.x0) <= SIGNATURE_BLOCK_X_TOL
-              and l.rect.y0 > heading.rect.y1]
-    if len(labels) != 1:
-        raise Unlocatable(
-            f"{spec.name}: {len(labels)} {row!r} labels in block "
-            f"{spec.locator['block']!r} on page {geo.index + 1}")
-    label = labels[0]
+    for heading in geo.lines_matching(spec.locator["block"]):
+        labels = [l for l in geo.lines_matching(row)
+                  if abs(l.rect.x0 - heading.rect.x0) <= SIGNATURE_BLOCK_X_TOL
+                  and l.rect.y0 > heading.rect.y1]
+        if len(labels) != 1:
+            notes.append(f"page {geo.index + 1}: {len(labels)} {row!r} labels "
+                         f"in block {spec.locator['block']!r}")
+            continue
+        label = labels[0]
 
-    def right_of(r: fitz.Rect) -> bool:
-        return 0 < r.x0 - label.rect.x1 <= SIGNATURE_ROW_MAX_GAP
+        def right_of(r: fitz.Rect) -> bool:
+            return 0 < r.x0 - label.rect.x1 <= SIGNATURE_ROW_MAX_GAP
 
-    boxes = [v.rect for v in _grey_boxes(geo, INPUT_BOX_HEIGHT_RANGE,
-                                         RULE_MIN_WIDTH)
-             if right_of(v.rect)
-             and (min(v.rect.y1, label.rect.y1) - max(v.rect.y0, label.rect.y0)
-                  >= ROW_BOX_MIN_OVERLAP * label.rect.height)]
-    if boxes:
-        if len(boxes) != 1:
-            raise Unlocatable(
-                f"{spec.name}: {len(boxes)} boxes beside {row!r} on page "
-                f"{geo.index + 1}")
-        b = boxes[0]
-        return Located(fitz.Rect(b.x0 + BOX_PAD_LEFT, b.y0 + BOX_PAD_Y,
-                                 b.x1 - BOX_PAD_RIGHT, b.y1 - BOX_PAD_Y),
-                       box_height=round(b.height, 1))
+        boxes = [v.rect for v in _grey_boxes(geo, INPUT_BOX_HEIGHT_RANGE,
+                                             RULE_MIN_WIDTH)
+                 if right_of(v.rect)
+                 and (min(v.rect.y1, label.rect.y1)
+                      - max(v.rect.y0, label.rect.y0))
+                 >= ROW_BOX_MIN_OVERLAP * label.rect.height]
+        if boxes:
+            if len(boxes) != 1:
+                notes.append(f"page {geo.index + 1}: {len(boxes)} boxes beside "
+                             f"{row!r}")
+                continue
+            b = boxes[0]
+            out.append(Located(
+                fitz.Rect(b.x0 + BOX_PAD_LEFT, b.y0 + BOX_PAD_Y,
+                          b.x1 - BOX_PAD_RIGHT, b.y1 - BOX_PAD_Y),
+                box_height=round(b.height, 1)))
+            continue
 
-    rules = [v.rect for v in geo.rects
-             if v.rect.height <= RULE_MAX_HEIGHT
-             and v.rect.width >= RULE_MIN_WIDTH
-             and right_of(v.rect)
-             and 0 < v.rect.y0 - label.rect.y1 <= RULE_MAX_DROP_FROM_LABEL]
-    if len(rules) != 1:
-        raise Unlocatable(
-            f"{spec.name}: no box and {len(rules)} ruled lines beside {row!r} "
-            f"on page {geo.index + 1}")
-    r = rules[0]
-    return Located(fitz.Rect(r.x0, r.y0 - RULED_LINE_FIELD_HEIGHT, r.x1, r.y0))
+        rules = [v.rect for v in geo.rects
+                 if v.rect.height <= RULE_MAX_HEIGHT
+                 and v.rect.width >= RULE_MIN_WIDTH
+                 and right_of(v.rect)
+                 and 0 < v.rect.y0 - label.rect.y1 <= RULE_MAX_DROP_FROM_LABEL]
+        if len(rules) != 1:
+            notes.append(f"page {geo.index + 1}: no box and {len(rules)} ruled "
+                         f"lines beside {row!r}")
+            continue
+        r = rules[0]
+        out.append(Located(
+            fitz.Rect(r.x0, r.y0 - RULED_LINE_FIELD_HEIGHT, r.x1, r.y0)))
+    return out, notes
 
 
 # ------------------------------------------------------- height -> line type
@@ -894,12 +901,14 @@ def cluster_heights(heights: Iterable[float]) -> HeightClusters:
 @dataclass
 class Placement:
     name: str
-    page: int
+    page: int                      # 1-based, discovered not configured
     kind: str                      # text | checkbox | signature
     rect_pdf: tuple[float, float, float, float]
     tooltip: str
     multiline: bool = False
     check_color: tuple[float, float, float] = CHECK_DARK
+    group: Optional[str] = None    # signature blocks tab together as a column
+    top_y: float = 0.0             # PDF-space top edge, for the order check
 
 
 @dataclass
@@ -909,106 +918,139 @@ class Resolution:
     problems: list[str]
     warnings: list[str]
     row_heights: dict[str, float]
-    contact_layout: dict[str, str]
+    pages_found: dict[str, int]
 
 
-def _contact_rects(box: fitz.Rect) -> tuple[list[fitz.Rect], str]:
-    """Three sub-rects inside `box`: stacked if it is tall enough, else columns."""
-    n = len(CONTACT_PARTS)
-    if box.height >= n * CONTACT_MIN_STACK_ROW_HEIGHT:
-        h = box.height / n
-        return ([fitz.Rect(box.x0, box.y0 + i * h, box.x1, box.y0 + (i + 1) * h)
-                 for i in range(n)], "stacked")
-    total = box.width - CONTACT_COLUMN_GUTTER * (n - 1)
-    rects, x = [], box.x0
-    for w in CONTACT_COLUMN_WEIGHTS:
-        rects.append(fitz.Rect(x, box.y0, x + total * w, box.y1))
-        x += total * w + CONTACT_COLUMN_GUTTER
-    return rects, "side-by-side"
+def _search(doc: DocumentConfig, pages: list[PageGeometry], spec: Spec):
+    """Run a spec's locator over every page; return (candidates, notes)."""
+    cands: list[tuple[int, Located]] = []
+    notes: list[str] = []
+    for geo in pages:
+        if spec.kind == "row":
+            found, n = locate_row(geo, spec)
+        elif spec.kind == "checkbox":
+            found, n = locate_checkbox(geo, spec)
+        elif spec.kind == "signature":
+            found, n = locate_signature_panel(geo, spec, doc)
+        else:
+            found, n = locate_signature_row(geo, spec)
+        cands += [(geo.index, f) for f in found]
+        notes += n
+    return cands, notes
 
 
 def resolve(doc: DocumentConfig, pages: list[PageGeometry]) -> Resolution:
     problems: list[str] = []
     warnings: list[str] = []
-    found: list[tuple[Spec, Located]] = []
+    found: list[tuple[Spec, int, Located]] = []
 
     for spec in doc.fields:
-        geo = pages[spec.page - 1]
-        try:
-            if spec.kind == "row":
-                loc = locate_row(geo, spec)
-            elif spec.kind == "checkbox":
-                loc = locate_checkbox(geo, spec)
-            elif spec.kind == "signature":
-                loc = locate_signature_panel(geo, spec, doc)
-            else:
-                loc = locate_signature_row(geo, spec)
-        except Unlocatable as exc:
-            problems.append(str(exc))
+        cands, notes = _search(doc, pages, spec)
+
+        # Secondary disambiguation: the grey hint beneath the label.
+        want_hint = spec.locator.get("hint")
+        if len(cands) > 1 and want_hint:
+            narrowed = [c for c in cands
+                        if c[1].hint and norm(c[1].hint) == norm(want_hint)]
+            if len(narrowed) == 1:
+                cands = narrowed
+
+        if len(cands) != 1:
+            where = ", ".join(f"page {i + 1}" for i, _ in cands) or "nowhere"
+            detail = ("; " + "; ".join(notes)) if notes else ""
+            problems.append(
+                f"{spec.name}: resolved to {len(cands)} targets ({where}) "
+                f"-- need exactly 1{detail}")
             continue
-        if loc.warning:
-            warnings.append(loc.warning)
-        found.append((spec, loc))
+
+        page_idx, loc = cands[0]
+        if want_hint and (loc.hint is None or norm(loc.hint) != norm(want_hint)):
+            warnings.append(
+                f"{spec.name}: hint reads {loc.hint!r}, config says "
+                f"{want_hint!r} (located anyway, on label)")
+        found.append((spec, page_idx, loc))
 
     clusters = cluster_heights(
-        loc.box_height for spec, loc in found
+        loc.box_height for spec, _, loc in found
         if spec.kind == "row" and spec.sizing == "auto")
 
     placements: list[Placement] = []
     row_heights: dict[str, float] = {}
-    contact_layout: dict[str, str] = {}
+    pages_found: dict[str, int] = {}
 
-    for spec, loc in found:
-        geo = pages[spec.page - 1]
-
-        def emit(name, rect, tooltip, kind="text", multiline=False):
-            r = rect * geo.to_pdf
-            placements.append(Placement(
-                name=name, page=spec.page, kind=kind,
-                rect_pdf=(round(r.x0, 2), round(r.y0, 2),
-                          round(r.x1, 2), round(r.y1, 2)),
-                tooltip=tooltip, multiline=multiline,
-                check_color=spec.check_color))
-
-        tooltip = (spec.tooltip or loc.hint or spec.locator.get("label")
-                   or spec.locator.get("caption") or spec.name)
-
-        if spec.kind == "checkbox":
-            emit(spec.name, loc.rect, tooltip, kind="checkbox")
-            continue
-        if spec.kind == "signature":
-            emit(spec.name, loc.rect, tooltip, kind="signature")
-            continue
-
+    for spec, page_idx, loc in found:
+        geo = pages[page_idx]
+        pages_found[spec.name] = page_idx + 1
         if loc.box_height is not None:
             row_heights[spec.name] = loc.box_height
 
-        if spec.sizing == "contact3":
-            rects, layout = _contact_rects(loc.rect)
-            contact_layout[spec.name] = layout
-            label = spec.locator.get("label", spec.name)
-            for part, part_label, rect in zip(CONTACT_PARTS,
-                                              CONTACT_PART_LABELS, rects):
-                emit(f"{spec.name}_{part}", rect, f"{label}: {part_label}")
-            continue
-
-        if spec.sizing == "multi":
-            multiline = True
-        elif spec.sizing == "single":
-            multiline = False
+        if spec.kind == "checkbox":
+            kind, multiline = "checkbox", False
+        elif spec.kind == "signature":
+            kind, multiline = "signature", False
         else:
-            multiline = clusters.is_multiline(loc.box_height)
-            if loc.box_height in clusters.ambiguous:
-                warnings.append(
-                    f"{spec.name}: box height {loc.box_height} pt sits within "
-                    f"{HEIGHT_AMBIGUITY_BAND} pt of the cluster threshold "
-                    f"{clusters.threshold:.2f}; placed SINGLE-line -- set "
-                    f"kind= explicitly in the config to override")
+            kind = "text"
+            if spec.sizing == "multi":
+                multiline = True
+            elif spec.sizing == "single":
                 multiline = False
-        emit(spec.name, loc.rect, tooltip, multiline=multiline)
+            else:
+                multiline = clusters.is_multiline(loc.box_height)
+                if loc.box_height in clusters.ambiguous:
+                    warnings.append(
+                        f"{spec.name}: box height {loc.box_height} pt sits "
+                        f"within {HEIGHT_AMBIGUITY_BAND} pt of the cluster "
+                        f"threshold {clusters.threshold:.2f}; placed "
+                        f"SINGLE-line -- set kind= explicitly to override")
+                    multiline = False
+
+        r = loc.rect * geo.to_pdf
+        placements.append(Placement(
+            name=spec.name, page=page_idx + 1, kind=kind,
+            rect_pdf=(round(r.x0, 2), round(r.y0, 2),
+                      round(r.x1, 2), round(r.y1, 2)),
+            tooltip=(spec.tooltip or loc.hint or spec.locator.get("label")
+                     or spec.locator.get("caption") or spec.name),
+            multiline=multiline, check_color=spec.check_color,
+            group=spec.group, top_y=round(max(r.y0, r.y1), 2)))
 
     return Resolution(placements, clusters, problems, warnings,
-                      row_heights, contact_layout)
+                      row_heights, pages_found)
+
+
+def check_reading_order(placements: list[Placement]) -> list[str]:
+    """Tab order must read top to bottom per page, signature blocks by column."""
+    issues = []
+    by_page: dict[int, list[Placement]] = {}
+    for p in placements:
+        by_page.setdefault(p.page, []).append(p)
+
+    for page, items in sorted(by_page.items()):
+        # collapse each signature block into a single run at its own position
+        runs: list[list[Placement]] = []
+        for p in items:
+            if p.group and runs and runs[-1][0].group == p.group:
+                runs[-1].append(p)
+            else:
+                runs.append([p])
+        tops = [max(r_.top_y for r_ in run) for run in runs]
+        for a, b in zip(tops, tops[1:]):
+            if b > a + 0.5:
+                issues.append(
+                    f"page {page}: tab order is not top-to-bottom "
+                    f"(y {a:.1f} then y {b:.1f})")
+                break
+        for run in runs:
+            if len(run) < 2:
+                continue
+            ys = [r_.top_y for r_ in run]
+            for a, b in zip(ys, ys[1:]):
+                if b > a + 0.5:
+                    issues.append(
+                        f"page {page}: block {run[0].group!r} is not "
+                        f"top-to-bottom internally")
+                    break
+    return issues
 
 
 # ------------------------------------------------------------------- writing
@@ -1279,10 +1321,20 @@ def process(doc: DocumentConfig, src: Optional[str] = None,
     else:
         print(f"  single-line ({len(res.row_heights)}): every located row")
 
-    if res.contact_layout:
-        for name, layout in res.contact_layout.items():
-            print(f"  contact split [{layout}]: {name}"
-                  f"_{{{','.join(CONTACT_PARTS)}}}")
+    spread: dict[int, int] = {}
+    for pg in res.pages_found.values():
+        spread[pg] = spread.get(pg, 0) + 1
+    print("  fields per page (discovered, not configured): "
+          + ", ".join(f"p{k}={v}" for k, v in sorted(spread.items())))
+
+    order_issues = check_reading_order(res.placements)
+    if order_issues:
+        print("  !! tab order check:")
+        for i in order_issues:
+            print("     -", i)
+    else:
+        print("  ok  tab order reads top-to-bottom on every page "
+              "(signature blocks grouped by column)")
 
     if res.warnings:
         print("\n  WARNINGS:")
@@ -1347,6 +1399,76 @@ def shift_test(doc: DocumentConfig, dx: float = 6.5, dy: float = -9.25) -> bool:
     return worst < 0.05
 
 
+def repaginate_test(doc: DocumentConfig) -> bool:
+    """Prove nothing is keyed to a page number: insert a blank first page and
+    move the trailing pages to the front, then expect the same fields on
+    their new pages."""
+    import tempfile, os
+    print(f"\n### repagination test [{doc.key}]")
+    tmp = tempfile.mkdtemp()
+
+    base = fitz.open(doc.src)
+    base_res = resolve(doc, probe(base))
+    n = base.page_count
+    base.close()
+
+    variants = {}
+    # (a) blank cover page inserted at the front -> every page index +1
+    shifted = os.path.join(tmp, "prepend.pdf")
+    d = fitz.open(doc.src)
+    d.new_page(0)
+    d.save(shifted)
+    d.close()
+    variants["blank page prepended"] = (shifted, {p: p + 1 for p in range(1, n + 1)})
+
+    # (b) last page moved to the front -> a genuine reordering
+    rotated = os.path.join(tmp, "rotate.pdf")
+    d = fitz.open(doc.src)
+    d.move_page(n - 1, 0)
+    d.save(rotated)
+    d.close()
+    variants["last page moved to front"] = (
+        rotated, {**{p: p + 1 for p in range(1, n)}, n: 1})
+
+    ok = True
+    for label, (path, remap) in variants.items():
+        v = fitz.open(path)
+        res = resolve(doc, probe(v))
+        v.close()
+        if res.problems:
+            print(f"  !! {label}: {len(res.problems)} unlocated")
+            for pr in res.problems[:3]:
+                print("     -", pr)
+            ok = False
+            continue
+        if len(res.placements) != len(base_res.placements):
+            print(f"  !! {label}: {len(base_res.placements)} -> "
+                  f"{len(res.placements)} widgets")
+            ok = False
+            continue
+        moved = {}
+        bad = 0
+        for a, b in zip(base_res.placements, res.placements):
+            if a.name != b.name or a.multiline != b.multiline:
+                bad += 1
+                continue
+            if b.page != remap[a.page]:
+                bad += 1
+                continue
+            if max(abs(x - y) for x, y in zip(a.rect_pdf, b.rect_pdf)) > 0.05:
+                bad += 1
+                continue
+            moved[a.page] = b.page
+        if bad:
+            print(f"  !! {label}: {bad} fields landed wrong")
+            ok = False
+        else:
+            trace = ", ".join(f"p{k}->p{v}" for k, v in sorted(moved.items()))
+            print(f"  ok  {label}: all {len(res.placements)} widgets followed "
+                  f"their content ({trace})")
+    return ok
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -1354,6 +1476,8 @@ def main(argv=None) -> int:
     ap.add_argument("--only", help="process a single document by config key")
     ap.add_argument("--shift-test", action="store_true",
                     help="run the layout-shift robustness check and exit")
+    ap.add_argument("--repaginate-test", action="store_true",
+                    help="run the repagination robustness check and exit")
     ap.add_argument("--verify-only", metavar="PDF")
     ap.add_argument("--quiet-rows", action="store_true",
                     help="suppress the per-field table")
@@ -1370,6 +1494,9 @@ def main(argv=None) -> int:
 
     if args.shift_test:
         return 0 if all(shift_test(d) for d in docs) else 1
+
+    if args.repaginate_test:
+        return 0 if all(repaginate_test(d) for d in docs) else 1
 
     return 0 if all(process(d, quiet_rows=args.quiet_rows)
                     for d in docs) else 1
