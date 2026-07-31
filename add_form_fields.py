@@ -91,6 +91,17 @@ TEXT_COLOR = (0x15 / 255, 0x14 / 255, 0x21 / 255)
 
 CHECK_DARK = TEXT_COLOR              # tick on a white/pale checkbox
 CHECK_LIGHT = (1.0, 1.0, 1.0)        # tick on a saturated background
+CHECK_AUTO = None                    # measure the box interior and choose
+
+# A checkbox drawn as an outline on a saturated band needs a light tick; the
+# same outline on a white fill needs a dark one, and the two look identical
+# in the vector data (both are a white path).  So sample what is actually
+# behind the tick: render the interior of the located square and take its
+# median grey.  Design A changed from a purple band to a pale one between
+# exports, which is exactly the silent-failure this avoids.
+CHECK_SAMPLE_INSET = 0.3             # fraction trimmed off each edge
+CHECK_SAMPLE_DPI = 288
+CHECK_LIGHT_BG_THRESHOLD = 0.5       # median grey above this -> dark tick
 
 # Padding inside a located grey box, so the widget does not overhang the
 # rounded corners and typed text is not flush against the edge.
@@ -193,7 +204,7 @@ class Spec:
     locator: dict[str, Any]
     sizing: str = "auto"            # auto | single | multi
     tooltip: Optional[str] = None
-    check_color: tuple[float, float, float] = CHECK_DARK
+    check_color: Optional[tuple[float, float, float]] = CHECK_AUTO
     group: Optional[str] = None     # signature blocks tab together as a column
 
 
@@ -202,7 +213,9 @@ def Row(name, *, label, hint=None, kind="auto", tooltip=None):
                 sizing=kind, tooltip=tooltip)
 
 
-def Check(name, *, caption, check=CHECK_DARK, tooltip=None):
+def Check(name, *, caption, check=CHECK_AUTO, tooltip=None):
+    """check=CHECK_AUTO measures the box interior; pass CHECK_DARK or
+    CHECK_LIGHT to pin it."""
     return Spec(name, "checkbox", {"caption": caption},
                 tooltip=tooltip, check_color=check)
 
@@ -313,10 +326,8 @@ DOC_A = DocumentConfig(
             hint="e.g. Issuer wallet → treasury → investors; redemption within 5 days"),
 
         # ---- page 5: acceptance + signatures ----
-        # White tick: this checkbox is an outline on a saturated purple band.
         Check("accept_terms",
-              caption="I accept the terms as outlined in this offer.",
-              check=CHECK_LIGHT),
+              caption="I accept the terms as outlined in this offer."),
         *Signature("signature_issuer", block="Issuer — Authorized Signatory"),
         *Signature("signature_assetera",
                    block="Assetera GmbH — Countersignature"),
@@ -484,11 +495,8 @@ DOC_B = DocumentConfig(
             label="Other trading venues", hint="If available"),
 
         # ---- page 8: acceptance + signatures ----
-        # Dark tick: unlike document A this checkbox is white-filled on a pale
-        # lavender band, so the standard dark tick reads correctly.
         Check("accept_terms",
-              caption="I accept the terms as outlined in this offer.",
-              check=CHECK_DARK),
+              caption="I accept the terms as outlined in this offer."),
         *Signature("signature_issuer", block="Issuer — Authorized Signatory"),
         *Signature("signature_assetera",
                    block="Assetera GmbH — Countersignature"),
@@ -580,6 +588,7 @@ class VectorRect:
 class PageGeometry:
     index: int                       # 0-based
     to_pdf: fitz.Matrix              # fitz page space -> PDF user space
+    page: Any = None                 # fitz.Page, for interior sampling
     lines: list[TextLine] = dc_field(default_factory=list)
     rects: list[VectorRect] = dc_field(default_factory=list)
 
@@ -601,7 +610,7 @@ def probe(doc: fitz.Document) -> list[PageGeometry]:
     pages = []
     for page in doc:
         geo = PageGeometry(index=page.number,
-                           to_pdf=~page.transformation_matrix)
+                           to_pdf=~page.transformation_matrix, page=page)
         for block in page.get_text("dict")["blocks"]:
             if block["type"] != 0:
                 continue
@@ -704,6 +713,7 @@ class Located:
     hint: Optional[str] = None
     box_height: Optional[float] = None
     warning: Optional[str] = None
+    luminance: Optional[float] = None   # checkboxes: interior brightness
 
 
 def _grey_boxes(geo: PageGeometry, height_range, min_width) -> list[VectorRect]:
@@ -739,6 +749,31 @@ def locate_row(geo: PageGeometry, spec: Spec) -> tuple[list[Located], list[str]]
             hint=(hint.text if hint else None),
             box_height=round(b.height, 1)))
     return out, notes
+
+
+def interior_luminance(geo: PageGeometry, rect: fitz.Rect) -> Optional[float]:
+    """Median grey of what is drawn *inside* a located square, 0..1.
+
+    The tick has to contrast with this, not with the square's own path
+    colour: an outline box on a purple band and the same outline on a white
+    fill are both "white" in the vector data.
+    """
+    if geo.page is None:
+        return None
+    dx, dy = rect.width * CHECK_SAMPLE_INSET, rect.height * CHECK_SAMPLE_INSET
+    clip = fitz.Rect(rect.x0 + dx, rect.y0 + dy, rect.x1 - dx, rect.y1 - dy)
+    if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+        return None
+    try:
+        pix = geo.page.get_pixmap(clip=clip, colorspace=fitz.csGRAY,
+                                  dpi=CHECK_SAMPLE_DPI)
+    except Exception:
+        return None
+    data = bytes(pix.samples)
+    if not data:
+        return None
+    ordered = sorted(data)
+    return ordered[len(ordered) // 2] / 255.0
 
 
 def locate_checkbox(geo: PageGeometry, spec: Spec) -> tuple[list[Located],
@@ -777,7 +812,8 @@ def locate_checkbox(geo: PageGeometry, spec: Spec) -> tuple[list[Located],
             notes.append(f"page {geo.index + 1}: {len(merged)} squares left of "
                          f"{spec.locator['caption']!r}")
             continue
-        out.append(Located(merged[0]))
+        out.append(Located(merged[0],
+                           luminance=interior_luminance(geo, merged[0])))
     return out, notes
 
 
@@ -906,7 +942,7 @@ class Placement:
     rect_pdf: tuple[float, float, float, float]
     tooltip: str
     multiline: bool = False
-    check_color: tuple[float, float, float] = CHECK_DARK
+    check_color: Optional[tuple[float, float, float]] = CHECK_AUTO
     group: Optional[str] = None    # signature blocks tab together as a column
     top_y: float = 0.0             # PDF-space top edge, for the order check
 
@@ -919,6 +955,7 @@ class Resolution:
     warnings: list[str]
     row_heights: dict[str, float]
     pages_found: dict[str, int]
+    tick_notes: list[str]
 
 
 def _search(doc: DocumentConfig, pages: list[PageGeometry], spec: Spec):
@@ -977,6 +1014,7 @@ def resolve(doc: DocumentConfig, pages: list[PageGeometry]) -> Resolution:
     placements: list[Placement] = []
     row_heights: dict[str, float] = {}
     pages_found: dict[str, int] = {}
+    tick_notes: list[str] = []
 
     for spec, page_idx, loc in found:
         geo = pages[page_idx]
@@ -986,10 +1024,28 @@ def resolve(doc: DocumentConfig, pages: list[PageGeometry]) -> Resolution:
 
         if spec.kind == "checkbox":
             kind, multiline = "checkbox", False
+            if spec.check_color is None:
+                lum = loc.luminance
+                if lum is None:
+                    check_color = CHECK_DARK
+                    warnings.append(
+                        f"{spec.name}: could not sample the box interior; "
+                        f"defaulted to a dark tick")
+                else:
+                    check_color = (CHECK_DARK if lum >= CHECK_LIGHT_BG_THRESHOLD
+                                   else CHECK_LIGHT)
+                    tick_notes.append(
+                        f"{spec.name}: interior grey {lum:.2f} -> "
+                        f"{'dark' if lum >= CHECK_LIGHT_BG_THRESHOLD else 'light'}"
+                        f" tick")
+            else:
+                check_color = spec.check_color
         elif spec.kind == "signature":
             kind, multiline = "signature", False
+            check_color = CHECK_DARK
         else:
             kind = "text"
+            check_color = CHECK_DARK
             if spec.sizing == "multi":
                 multiline = True
             elif spec.sizing == "single":
@@ -1011,11 +1067,11 @@ def resolve(doc: DocumentConfig, pages: list[PageGeometry]) -> Resolution:
                       round(r.x1, 2), round(r.y1, 2)),
             tooltip=(spec.tooltip or loc.hint or spec.locator.get("label")
                      or spec.locator.get("caption") or spec.name),
-            multiline=multiline, check_color=spec.check_color,
+            multiline=multiline, check_color=check_color,
             group=spec.group, top_y=round(max(r.y0, r.y1), 2)))
 
     return Resolution(placements, clusters, problems, warnings,
-                      row_heights, pages_found)
+                      row_heights, pages_found, tick_notes)
 
 
 def check_reading_order(placements: list[Placement]) -> list[str]:
@@ -1326,6 +1382,9 @@ def process(doc: DocumentConfig, src: Optional[str] = None,
         spread[pg] = spread.get(pg, 0) + 1
     print("  fields per page (discovered, not configured): "
           + ", ".join(f"p{k}={v}" for k, v in sorted(spread.items())))
+
+    for n in res.tick_notes:
+        print("  tick colour:", n)
 
     order_issues = check_reading_order(res.placements)
     if order_issues:
